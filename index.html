@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Fluid Sandbox</title>
+	<style>
+		:root {
+			color-scheme: light;
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		html, body {
+			margin: 0;
+			width: 100%;
+			height: 100%;
+			overflow: hidden;
+			background: #ffffff;
+			font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+		}
+
+		canvas {
+			position: fixed;
+			inset: 0;
+			width: 100%;
+			height: 100%;
+		}
+
+		.hint {
+			position: fixed;
+			right: 16px;
+			bottom: 16px;
+			padding: 10px 12px;
+			background: rgba(255, 255, 255, 0.8);
+			border: 1px solid #f0f0f0;
+			border-radius: 10px;
+			color: #444;
+			font-size: 14px;
+			box-shadow: 0 10px 30px rgba(0, 0, 0, 0.05);
+			user-select: none;
+		}
+	</style>
+</head>
+<body>
+<canvas id="fluid"></canvas>
+<div class="hint">Fluid fills ~20% of the screen.<br>Drag to stir.</div>
+
+<script>
+(() => {
+	const canvas = document.getElementById('fluid');
+	const ctx = canvas.getContext('2d');
+	const mask = document.createElement('canvas');
+	const maskCtx = mask.getContext('2d');
+
+	const cfg = {
+		particleRadius: 7,
+		restDistance: 14,
+		interactionRadius: 32,
+		restDensity: 9.5,
+		stiffness: 0.45,
+		nearStiffness: 0.95,
+		viscosity: 0.16,
+		gravity: 1200, // px/s^2
+		bounce: 0.38,
+		maxParticles: 2600,
+		dragForce: 2400,
+		airDrag: 0.99,
+		blobBlur: 7,
+		blobRadiusBoost: 3.8,
+		shadowBlur: 30,
+		shadowAlpha: 0.16,
+		shadowOffset: { x: 6, y: 10 }
+	};
+
+	const particles = [];
+	const buckets = new Map();
+	const cellSize = cfg.interactionRadius;
+	let lastTime = performance.now();
+	let dpr = window.devicePixelRatio || 1;
+	let drag = { active: false, x: 0, y: 0, lastX: 0, lastY: 0 };
+	let calm = { timer: 0, speed: 8, threshold: 0.7 };
+
+	const keyFor = (cx, cy) => `${cx},${cy}`;
+
+	function resize() {
+		dpr = window.devicePixelRatio || 1;
+		const { innerWidth: w, innerHeight: h } = window;
+		canvas.width = Math.round(w * dpr);
+		canvas.height = Math.round(h * dpr);
+		mask.width = canvas.width;
+		mask.height = canvas.height;
+		canvas.style.width = `${w}px`;
+		canvas.style.height = `${h}px`;
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		initFluid();
+	}
+
+	function initFluid() {
+		particles.length = 0;
+		const w = canvas.width / dpr;
+		const h = canvas.height / dpr;
+		const targetArea = w * h * 0.32; // ~32% of the screen for more liquid
+
+		const targetWidth = Math.min(w * 0.42, Math.sqrt(targetArea));
+		const targetHeight = Math.max(targetArea / targetWidth, cfg.restDistance * 4);
+		const spacing = cfg.restDistance;
+
+		const cols = Math.max(6, Math.floor(targetWidth / spacing));
+		const rows = Math.max(6, Math.floor(targetHeight / spacing));
+		const startX = cfg.particleRadius + 4;
+		const startY = cfg.particleRadius + 4;
+
+		for (let y = 0; y < rows; y++) {
+			for (let x = 0; x < cols; x++) {
+				if (particles.length >= cfg.maxParticles) break;
+				particles.push({
+					x: startX + x * spacing,
+					y: startY + y * spacing,
+					vx: 0,
+					vy: 0,
+					prevX: startX + x * spacing,
+					prevY: startY + y * spacing
+				});
+			}
+		}
+	}
+
+	function rebuildBuckets() {
+		buckets.clear();
+		const invCell = 1 / cellSize;
+		for (let i = 0; i < particles.length; i++) {
+			const p = particles[i];
+			const cx = Math.floor(p.x * invCell);
+			const cy = Math.floor(p.y * invCell);
+			const k = keyFor(cx, cy);
+			let cell = buckets.get(k);
+			if (!cell) {
+				cell = [];
+				buckets.set(k, cell);
+			}
+			cell.push(i);
+		}
+	}
+
+	function step(dt) {
+		const radius = cfg.interactionRadius;
+		const radius2 = radius * radius;
+		const pr = cfg.particleRadius;
+		const w = canvas.width / dpr;
+		const h = canvas.height / dpr;
+		const invCell = 1 / cellSize;
+		const densities = new Float32Array(particles.length);
+		const nearDensities = new Float32Array(particles.length);
+
+		// Apply external forces and integrate predicted positions
+		for (const p of particles) {
+			p.vy += cfg.gravity * dt;
+
+			if (drag.active) {
+				const dx = drag.x - p.x;
+				const dy = drag.y - p.y;
+				const dist2 = dx * dx + dy * dy;
+				const radiusDrag = 90;
+				if (dist2 < radiusDrag * radiusDrag) {
+					const dist = Math.sqrt(dist2) || 1;
+					const falloff = 1 - dist / radiusDrag;
+					const ux = (drag.x - drag.lastX) / dt;
+					const uy = (drag.y - drag.lastY) / dt;
+					p.vx += ux * falloff * (cfg.dragForce / 1000) * dt;
+					p.vy += uy * falloff * (cfg.dragForce / 1000) * dt;
+				}
+			}
+
+			p.prevX = p.x;
+			p.prevY = p.y;
+			p.x += p.vx * dt;
+			p.y += p.vy * dt;
+
+			if (p.x < pr) { p.x = pr; p.vx *= -cfg.bounce; }
+			else if (p.x > w - pr) { p.x = w - pr; p.vx *= -cfg.bounce; }
+			if (p.y < pr) { p.y = pr; p.vy *= -cfg.bounce; }
+			else if (p.y > h - pr) { p.y = h - pr; p.vy *= -cfg.bounce; }
+		}
+
+		rebuildBuckets();
+
+		// Density estimation (double-density relaxation)
+		for (let i = 0; i < particles.length; i++) {
+			const p = particles[i];
+			const cx = Math.floor(p.x * invCell);
+			const cy = Math.floor(p.y * invCell);
+			let density = 0;
+			let nearDensity = 0;
+			for (let ox = -1; ox <= 1; ox++) {
+				for (let oy = -1; oy <= 1; oy++) {
+					const cell = buckets.get(keyFor(cx + ox, cy + oy));
+					if (!cell) continue;
+					for (const j of cell) {
+						const q = particles[j];
+						const dx = q.x - p.x;
+						const dy = q.y - p.y;
+						const dist2 = dx * dx + dy * dy;
+						if (dist2 > radius2 || dist2 === 0) continue;
+						const dist = Math.sqrt(dist2);
+						const qn = 1 - dist / radius;
+						density += qn * qn;
+						nearDensity += qn * qn * qn;
+					}
+				}
+			}
+			densities[i] = density;
+			nearDensities[i] = nearDensity;
+		}
+
+		// Position corrections
+		for (let i = 0; i < particles.length; i++) {
+			const p = particles[i];
+			const cx = Math.floor(p.x * invCell);
+			const cy = Math.floor(p.y * invCell);
+			const pressure = cfg.stiffness * (densities[i] - cfg.restDensity);
+			const nearPressure = cfg.nearStiffness * nearDensities[i];
+
+			for (let ox = -1; ox <= 1; ox++) {
+				for (let oy = -1; oy <= 1; oy++) {
+					const cell = buckets.get(keyFor(cx + ox, cy + oy));
+					if (!cell) continue;
+					for (const j of cell) {
+						if (j <= i) continue;
+						const q = particles[j];
+						const dx = q.x - p.x;
+						const dy = q.y - p.y;
+						const dist2 = dx * dx + dy * dy;
+						if (dist2 > radius2 || dist2 === 0) continue;
+						const dist = Math.sqrt(dist2);
+						const qn = 1 - dist / radius;
+						const corr = (pressure * qn + nearPressure * qn * qn) * 0.5;
+						const nx = dx / dist;
+						const ny = dy / dist;
+						const push = corr * 0.5; // split correction
+						p.x -= nx * push;
+						p.y -= ny * push;
+						q.x += nx * push;
+						q.y += ny * push;
+					}
+				}
+			}
+			if (p.x < pr) p.x = pr; else if (p.x > w - pr) p.x = w - pr;
+			if (p.y < pr) p.y = pr; else if (p.y > h - pr) p.y = h - pr;
+		}
+
+		// Recompute velocities from corrected positions
+		let speedSum = 0;
+		for (const p of particles) {
+			p.vx = (p.x - p.prevX) / dt;
+			p.vy = (p.y - p.prevY) / dt;
+			p.vx *= cfg.airDrag;
+			p.vy *= cfg.airDrag;
+			speedSum += Math.hypot(p.vx, p.vy);
+		}
+
+		const avgSpeed = speedSum / particles.length;
+		if (avgSpeed < calm.speed) {
+			calm.timer += dt;
+			if (calm.timer > calm.threshold) {
+				for (const p of particles) {
+					p.vx = 0;
+					p.vy = 0;
+					p.prevX = p.x;
+					p.prevY = p.y;
+				}
+				calm.timer = calm.threshold;
+			}
+		} else {
+			calm.timer = 0;
+		}
+	}
+
+	function render() {
+		const wPx = canvas.width;
+		const hPx = canvas.height;
+
+		// Build a soft mask (metaball-like) from particles
+		maskCtx.setTransform(1, 0, 0, 1, 0, 0);
+		maskCtx.clearRect(0, 0, wPx, hPx);
+		const blur = cfg.blobBlur * dpr;
+		const r = (cfg.particleRadius + cfg.blobRadiusBoost) * dpr;
+		maskCtx.save();
+		maskCtx.filter = `blur(${blur}px)`;
+		maskCtx.fillStyle = '#fff';
+		maskCtx.beginPath();
+		for (const p of particles) {
+			const px = p.x * dpr;
+			const py = p.y * dpr;
+			maskCtx.moveTo(px + r, py);
+			maskCtx.arc(px, py, r, 0, Math.PI * 2);
+		}
+		maskCtx.fill();
+		maskCtx.restore();
+
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, wPx, hPx);
+
+		// Soft shadow
+		ctx.save();
+		ctx.globalAlpha = cfg.shadowAlpha;
+		ctx.filter = `blur(${cfg.shadowBlur * dpr}px)`;
+		ctx.drawImage(mask, cfg.shadowOffset.x * dpr, cfg.shadowOffset.y * dpr);
+		ctx.restore();
+
+		// Color fill clipped to mask
+		ctx.fillStyle = '#ff4fa3';
+		ctx.fillRect(0, 0, wPx, hPx);
+		ctx.globalCompositeOperation = 'destination-in';
+		ctx.drawImage(mask, 0, 0);
+		ctx.globalCompositeOperation = 'source-over';
+
+		// Subtle highlight
+		const g = ctx.createLinearGradient(0, 0, wPx, hPx);
+		g.addColorStop(0, 'rgba(255,255,255,0.42)');
+		g.addColorStop(0.45, 'rgba(255,255,255,0.12)');
+		g.addColorStop(1, 'rgba(255,255,255,0)');
+		ctx.save();
+		ctx.globalCompositeOperation = 'screen';
+		ctx.fillStyle = g;
+		ctx.fillRect(0, 0, wPx, hPx);
+		ctx.globalCompositeOperation = 'destination-in';
+		ctx.drawImage(mask, 0, 0);
+		ctx.restore();
+	}
+
+	function loop(now) {
+		const dt = Math.min(0.033, (now - lastTime) / 1000);
+		lastTime = now;
+		step(dt);
+		render();
+		requestAnimationFrame(loop);
+	}
+
+	function pointerDown(e) {
+		drag.active = true;
+		const rect = canvas.getBoundingClientRect();
+		drag.x = drag.lastX = (e.clientX - rect.left);
+		drag.y = drag.lastY = (e.clientY - rect.top);
+		calm.timer = 0; // wake the fluid when user interacts
+	}
+
+	function pointerMove(e) {
+		if (!drag.active) return;
+		const rect = canvas.getBoundingClientRect();
+		drag.lastX = drag.x;
+		drag.lastY = drag.y;
+		drag.x = (e.clientX - rect.left);
+		drag.y = (e.clientY - rect.top);
+	}
+
+	function pointerUp() {
+		drag.active = false;
+	}
+
+	window.addEventListener('resize', resize);
+	canvas.addEventListener('pointerdown', pointerDown);
+	window.addEventListener('pointermove', pointerMove);
+	window.addEventListener('pointerup', pointerUp);
+	window.addEventListener('pointerleave', pointerUp);
+
+	resize();
+	requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
