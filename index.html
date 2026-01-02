@@ -6,7 +6,7 @@
 	<title>Fluid Sandbox</title>
 	<style>
 		:root {
-			color-scheme: light;
+			color-scheme: light dark;
 		}
 
 		* {
@@ -41,6 +41,19 @@
 			font-size: 14px;
 			box-shadow: 0 10px 30px rgba(0, 0, 0, 0.05);
 			user-select: none;
+		}
+
+		@media (prefers-color-scheme: dark) {
+			html, body {
+				background: #05070e;
+			}
+
+			.hint {
+				background: rgba(15, 16, 24, 0.85);
+				border-color: #1e2230;
+				color: #f2f4ff;
+				box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+			}
 		}
 	</style>
 </head>
